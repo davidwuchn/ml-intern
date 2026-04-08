@@ -14,6 +14,15 @@ _THEME = Theme({
     "tool.fail": "dim red",
     "info": "dim",
     "muted": "dim",
+    # Markdown emphasis colors
+    "markdown.strong": "bold rgb(255,200,80)",
+    "markdown.emphasis": "italic rgb(180,140,40)",
+    "markdown.code": "rgb(120,220,255)",
+    "markdown.code_block": "rgb(120,220,255)",
+    "markdown.link": "underline rgb(90,180,255)",
+    "markdown.h1": "bold rgb(255,200,80)",
+    "markdown.h2": "bold rgb(240,180,95)",
+    "markdown.h3": "bold rgb(220,165,100)",
 })
 
 _console = Console(theme=_THEME, highlight=False)
@@ -234,7 +243,16 @@ def print_markdown(text: str) -> None:
 
     # Render markdown to a string buffer so we can type it out
     buf = io.StringIO()
-    buf_console = Console(file=buf, width=_console.width, highlight=False, theme=_THEME)
+    # Important: StringIO is not a TTY, so Rich would normally strip styles.
+    # Force terminal rendering so ANSI style codes are preserved for typewriter output.
+    buf_console = Console(
+        file=buf,
+        width=_console.width,
+        highlight=False,
+        theme=_THEME,
+        force_terminal=True,
+        color_system=_console.color_system or "truecolor",
+    )
     buf_console.print(Padding(Markdown(text), (0, 0, 0, 2)))
     rendered = buf.getvalue()
 
