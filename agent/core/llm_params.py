@@ -93,13 +93,53 @@ _patch_litellm_effort_validation()
 # Effort levels accepted on the wire.
 #   Anthropic (4.6+):  low | medium | high | xhigh | max   (output_config.effort)
 #   OpenAI direct:     minimal | low | medium | high | xhigh (reasoning_effort top-level)
-#   HF router:         low | medium | high                 (extra_body.reasoning_effort)
+#   HF router default: low | medium | high                 (extra_body.reasoning_effort)
+#   HF router premium user-billed overflow keeps the subsidized endpoint's
+#   provider-native effort set so overflow cannot silently lower or drop effort.
 #
 # We validate *shape* here and let the probe cascade walk down on rejection;
 # we deliberately do NOT maintain a per-model capability table.
 _ANTHROPIC_EFFORTS = {"low", "medium", "high", "xhigh", "max"}
 _OPENAI_EFFORTS = {"minimal", "low", "medium", "high", "xhigh"}
 _HF_EFFORTS = {"low", "medium", "high"}
+
+# Production still uses the historical subsidized endpoints while users are
+# within their daily premium allowance. Once a session overflows to user
+# billing, route the same logical model through the HF Inference Router/FAL
+# with the user's OAuth token.
+_USER_BILLED_HF_ROUTER_MODEL_BY_SUBSIDIZED_MODEL = {
+    "bedrock/us.anthropic.claude-opus-4-6-v1": (
+        "huggingface/anthropic/claude-opus-4.6:fal-ai"
+    ),
+    "bedrock/us.anthropic.claude-sonnet-4-6": (
+        "huggingface/anthropic/claude-sonnet-4-6:fal-ai"
+    ),
+    "openai/gpt-5.5": "huggingface/openai/gpt-5.5:fal-ai",
+}
+_SUBSIDIZED_MODEL_BY_USER_BILLED_HF_ROUTER_MODEL = {
+    user_billed: subsidized
+    for subsidized, user_billed in _USER_BILLED_HF_ROUTER_MODEL_BY_SUBSIDIZED_MODEL.items()
+}
+
+
+def _hf_router_effort_spec(
+    hf_model: str, bill_user: bool, reasoning_effort: str
+) -> tuple[str, set[str], str]:
+    """Return the effort value and accepted set for an HF-router call.
+
+    Generic HF-router models use the router's low/medium/high contract. Premium
+    overflow is different: the subsidized endpoint is the source of truth for
+    the effective effort we cached on the session, so the user-billed FAL call
+    must keep the same provider-native effort instead of silently dropping
+    ``max``/``xhigh``.
+    """
+    if bill_user and hf_model.startswith("anthropic/"):
+        level = "low" if reasoning_effort == "minimal" else reasoning_effort
+        return level, _ANTHROPIC_EFFORTS, "Anthropic"
+    if bill_user and hf_model.startswith("openai/"):
+        return reasoning_effort, _OPENAI_EFFORTS, "OpenAI"
+    level = "low" if reasoning_effort == "minimal" else reasoning_effort
+    return level, _HF_EFFORTS, "HF router"
 
 
 class UnsupportedEffortError(ValueError):
@@ -198,21 +238,45 @@ def _resolve_llm_params(
     runtime callers leave ``strict=False``, so a stale cached effort
     can't crash a turn — it just doesn't get sent.
 
-    Token precedence (first non-empty wins):
+    Token precedence for HF-router calls (first non-empty wins):
       1. INFERENCE_TOKEN env — shared key on the hosted Space (inference is
          free for users, billed to the Space owner via ``X-HF-Bill-To``).
       2. session.hf_token — the user's own token (CLI / OAuth / cache file).
       3. huggingface_hub cache — ``HF_TOKEN`` / ``HUGGING_FACE_HUB_TOKEN`` /
          local ``hf auth login`` cache.
 
-    Premium models routed through the HF router (``huggingface/anthropic/...``
-    or ``huggingface/openai/...``) can be billed to the user instead of the
-    Space: pass ``bill_to_user=True`` and the call uses the caller's own token
-    (starting at step 2, skipping INFERENCE_TOKEN) with no ``X-HF-Bill-To``. The
-    backend flips this on only once a user is past their subsidized daily
-    allowance; within the allowance, and for every free model, the default
-    subsidized path applies.
+    The production premium ids intentionally remain the old subsidized
+    endpoints (Bedrock Claude, direct OpenAI GPT-5.5). Pass
+    ``bill_to_user=True`` only after the daily subsidized allowance is spent;
+    those ids then map to the HF Router/FAL ids and use the caller's own token
+    (skipping ``INFERENCE_TOKEN`` and omitting ``X-HF-Bill-To``).
     """
+    if bill_to_user and (
+        user_billed_model := _USER_BILLED_HF_ROUTER_MODEL_BY_SUBSIDIZED_MODEL.get(
+            model_name
+        )
+    ):
+        return _resolve_llm_params(
+            user_billed_model,
+            session_hf_token,
+            reasoning_effort=reasoning_effort,
+            strict=strict,
+            bill_to_user=True,
+        )
+
+    if not bill_to_user and (
+        subsidized_model := _SUBSIDIZED_MODEL_BY_USER_BILLED_HF_ROUTER_MODEL.get(
+            model_name
+        )
+    ):
+        return _resolve_llm_params(
+            subsidized_model,
+            session_hf_token,
+            reasoning_effort=reasoning_effort,
+            strict=strict,
+            bill_to_user=False,
+        )
+
     if model_name.startswith("anthropic/"):
         params: dict = {"model": model_name}
         if reasoning_effort:
@@ -284,11 +348,13 @@ def _resolve_llm_params(
     if not bill_user and (bill_to := get_hf_bill_to()):
         params["extra_headers"] = {"X-HF-Bill-To": bill_to}
     if reasoning_effort:
-        hf_level = "low" if reasoning_effort == "minimal" else reasoning_effort
-        if hf_level not in _HF_EFFORTS:
+        hf_level, accepted_efforts, effort_owner = _hf_router_effort_spec(
+            hf_model, bill_user, reasoning_effort
+        )
+        if hf_level not in accepted_efforts:
             if strict:
                 raise UnsupportedEffortError(
-                    f"HF router doesn't accept effort={hf_level!r}"
+                    f"{effort_owner} doesn't accept effort={hf_level!r}"
                 )
         else:
             params["extra_body"] = {"reasoning_effort": hf_level}
