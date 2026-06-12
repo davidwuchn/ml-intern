@@ -23,6 +23,7 @@ import { useLayoutStore } from '@/store/layoutStore';
 import { logger } from '@/utils/logger';
 
 const USAGE_THRESHOLD_TOOL_NAME = 'usage_threshold';
+const YOLO_BUDGET_TOOL_NAME = 'yolo_budget';
 
 interface UseAgentChatOptions {
   sessionId: string;
@@ -75,7 +76,9 @@ function pendingApprovalIds(items: PendingApprovalItem[] | undefined): Set<strin
 function waitingApprovalStatus(items: PendingApprovalItem[] | undefined) {
   return {
     type: 'waiting-approval' as const,
-    approvalKind: items?.some((item) => item.tool === USAGE_THRESHOLD_TOOL_NAME)
+    approvalKind: items?.some((item) =>
+      item.tool === USAGE_THRESHOLD_TOOL_NAME || item.tool === YOLO_BUDGET_TOOL_NAME
+    )
       ? 'usage' as const
       : 'tool' as const,
   };
@@ -400,6 +403,17 @@ export function useAgentChat({ sessionId, isActive, isProcessing = false, onRead
       },
       onUsageEvent: (eventType, data) => {
         useUsageStore.getState().applyUsageEvent(sessionId, eventType, data);
+      },
+      onSessionUpdate: (data) => {
+        const autoApproval = data.auto_approval;
+        if (autoApproval && typeof autoApproval === 'object') {
+          updateSessionYolo(sessionId, autoApproval as {
+            enabled: boolean;
+            cost_cap_usd?: number | null;
+            estimated_spend_usd?: number;
+            remaining_usd?: number | null;
+          });
+        }
       },
       onInterrupted: () => { /* no-op — handled by stop() caller */ },
       onRecoverMessages: async ({
@@ -753,6 +767,16 @@ export function useAgentChat({ sessionId, isActive, isProcessing = false, onRead
             if (state === 'running' && toolName) sideChannel.onToolRunning(toolName);
           } else if (et === 'llm_call' || et === 'hf_job_complete' || et === 'sandbox_destroy') {
             sideChannel.onUsageEvent(et, (event.data || {}) as Record<string, unknown>);
+          } else if (et === 'session_update') {
+            const autoApproval = event.data?.auto_approval;
+            if (autoApproval && typeof autoApproval === 'object') {
+              updateSessionYolo(sessionId, autoApproval as {
+                enabled: boolean;
+                cost_cap_usd?: number | null;
+                estimated_spend_usd?: number;
+                remaining_usd?: number | null;
+              });
+            }
           } else if (et === 'turn_complete' || et === 'error' || et === 'interrupted') {
             sideChannel.onProcessingDone();
             stopReconnect();

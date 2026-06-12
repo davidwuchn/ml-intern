@@ -376,6 +376,54 @@ async def test_runtime_usage_includes_requested_session_total():
 
 
 @pytest.mark.asyncio
+async def test_runtime_usage_clips_requested_session_to_usage_window():
+    usage_window_started_at = datetime(2026, 6, 5, 12, 30, tzinfo=UTC)
+    manager = _Manager(
+        {
+            "s1": SimpleNamespace(
+                session_id="s1",
+                user_id="owner",
+                usage_window_started_at=usage_window_started_at,
+                session=SimpleNamespace(
+                    logged_events=[
+                        _event(
+                            "llm_call",
+                            {"cost_usd": 99.0},
+                            created_at="2026-06-05T12:00:00+00:00",
+                        ),
+                        _event(
+                            "llm_call",
+                            {"cost_usd": 0.25},
+                            created_at="2026-06-05T12:45:00+00:00",
+                        ),
+                        _event(
+                            "hf_job_complete",
+                            {
+                                "estimated_cost_usd": 1.5,
+                                "billable_seconds_estimate": 1800,
+                            },
+                            created_at="2026-06-05T12:50:00+00:00",
+                        ),
+                    ]
+                ),
+            )
+        }
+    )
+
+    usage = await build_usage_response(
+        manager,
+        user_id="owner",
+        session_id="s1",
+        timezone_name="UTC",
+        now=datetime(2026, 6, 5, 13, 0, tzinfo=UTC),
+    )
+
+    assert usage["session"]["inference_usd"] == 0.25
+    assert usage["session"]["hf_jobs_estimated_usd"] == 1.5
+    assert usage["session"]["total_usd"] == 1.75
+
+
+@pytest.mark.asyncio
 async def test_runtime_usage_includes_requested_session_tokens():
     manager = _Manager(
         {
@@ -687,7 +735,12 @@ async def test_usage_response_loads_only_session_events(monkeypatch):
         now=datetime(2026, 6, 5, 13, 0, tzinfo=UTC),
     )
 
-    assert store.calls == [("owner", {"session_id": "s1", "start": None, "end": None})]
+    assert store.calls == [
+        (
+            "owner",
+            {"session_id": "s1", "start": session_created_at, "end": None},
+        )
+    ]
     assert usage_v2_starts == [datetime(2026, 6, 1, 0, 0, tzinfo=UTC)]
     assert session_usage_starts == [session_created_at]
     assert datetime(2026, 6, 5, 0, 0, tzinfo=UTC) not in usage_v2_starts

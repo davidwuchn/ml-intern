@@ -719,10 +719,17 @@ async def build_usage_response(
 
     session_events: list[dict[str, Any]] = []
     if session_id:
+        session_start = _session_usage_window_started_at(manager, session_id)
+        if session_start is None:
+            session_start, _ = await _load_persisted_session_usage_window_metadata(
+                manager,
+                session_id,
+            )
         session_events = await _load_usage_events(
             manager,
             user_id=user_id,
             session_id=session_id,
+            start=session_start,
         )
 
     hf_account = await _build_hf_account_usage(

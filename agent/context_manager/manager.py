@@ -154,20 +154,21 @@ async def summarize_messages(
         llm_params,
         session_id=router_session_id_for(session),
     )
+    llm_params = {**llm_params, "max_completion_tokens": max_tokens}
     prompt_messages, tool_specs = with_prompt_caching(
         prompt_messages, tool_specs, llm_params
     )
     _t0 = time.monotonic()
     response = await acompletion(
         messages=prompt_messages,
-        max_completion_tokens=max_tokens,
         tools=tool_specs,
         **llm_params,
     )
     if session is not None:
         from agent.core import telemetry
+        from agent.core.yolo_budget import maybe_pause_yolo_after_spend
 
-        await telemetry.record_llm_call(
+        usage = await telemetry.record_llm_call(
             session,
             model=model_name,
             response=response,
@@ -176,6 +177,13 @@ async def summarize_messages(
             if response.choices
             else None,
             kind=kind,
+        )
+        await maybe_pause_yolo_after_spend(
+            session,
+            spend_kind=kind,
+            observed_cost_usd=usage.get("cost_usd")
+            if isinstance(usage, dict)
+            else None,
         )
     summary = response.choices[0].message.content or ""
     completion_tokens = response.usage.completion_tokens if response.usage else 0

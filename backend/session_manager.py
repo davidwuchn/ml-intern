@@ -28,6 +28,14 @@ from agent.core.usage_thresholds import (
     normalize_usage_threshold,
     usage_threshold_pending_to_tool,
 )
+from agent.core.yolo_budget import (
+    YOLO_BUDGET_TOOL_NAME,
+    is_yolo_budget_pending,
+    request_yolo_budget_exceeded_approval,
+    seed_session_spend,
+    session_spend_usd,
+    yolo_budget_pending_to_tool,
+)
 from agent.messaging.gateway import NotificationGateway
 
 # Get project root (parent of backend directory)
@@ -313,7 +321,7 @@ class SessionManager:
 
     def _serialize_pending_approval(self, session: Session) -> list[dict[str, Any]]:
         pending = session.pending_approval or {}
-        if is_usage_threshold_pending(pending):
+        if is_usage_threshold_pending(pending) or is_yolo_budget_pending(pending):
             return [dict(pending)]
         tool_calls = pending.get("tool_calls") or []
         serialized: list[dict[str, Any]] = []
@@ -329,6 +337,8 @@ class SessionManager:
         pending = session.pending_approval or {}
         if is_usage_threshold_pending(pending):
             return [usage_threshold_pending_to_tool(pending)]
+        if is_yolo_budget_pending(pending):
+            return [yolo_budget_pending_to_tool(pending)]
         tool_calls = pending.get("tool_calls") or []
         if not tool_calls:
             return None
@@ -354,7 +364,10 @@ class SessionManager:
             session.pending_approval = None
             return
         first = pending_approval[0]
-        if isinstance(first, dict) and first.get("kind") == USAGE_THRESHOLD_TOOL_NAME:
+        if isinstance(first, dict) and first.get("kind") in {
+            USAGE_THRESHOLD_TOOL_NAME,
+            YOLO_BUDGET_TOOL_NAME,
+        }:
             session.pending_approval = dict(first)
             return
         from litellm import ChatCompletionMessageToolCall as ToolCall
@@ -388,6 +401,8 @@ class SessionManager:
         first = pending_approval[0]
         if isinstance(first, dict) and first.get("kind") == USAGE_THRESHOLD_TOOL_NAME:
             return [usage_threshold_pending_to_tool(first)]
+        if isinstance(first, dict) and first.get("kind") == YOLO_BUDGET_TOOL_NAME:
+            return [yolo_budget_pending_to_tool(first)]
         result: list[dict[str, Any]] = []
         for raw in pending_approval:
             if "function" in raw:
@@ -457,6 +472,15 @@ class SessionManager:
             )
 
         agent_session.session.usage_threshold_checker = _checker
+
+    def _install_yolo_budget_checker(self, agent_session: AgentSession) -> None:
+        async def _checker(payload: dict[str, Any]) -> bool:
+            return await self._maybe_request_yolo_budget_approval(
+                agent_session.session_id,
+                payload,
+            )
+
+        agent_session.session.yolo_budget_checker = _checker
 
     @staticmethod
     def _set_inference_billing_session_id(
@@ -555,7 +579,12 @@ class SessionManager:
                 window_start = window_start.astimezone(UTC)
         events = []
         for raw_event in getattr(agent_session.session, "logged_events", []) or []:
-            if raw_event.get("event_type") not in {"llm_call", "hf_job_complete"}:
+            if raw_event.get("event_type") not in {
+                "llm_call",
+                "hf_job_complete",
+                "sandbox_create",
+                "sandbox_destroy",
+            }:
                 continue
             if isinstance(window_start, datetime):
                 created_at = event_created_at(raw_event, timezone_name="UTC")
@@ -633,6 +662,78 @@ class SessionManager:
             )
         )
         return True
+
+    async def _maybe_request_yolo_budget_approval(
+        self,
+        session_id: str,
+        payload: dict[str, Any],
+    ) -> bool:
+        agent_session = self.sessions.get(session_id)
+        if not agent_session or not agent_session.is_active:
+            return False
+
+        session = agent_session.session
+        if session.pending_approval:
+            return False
+        if not bool(getattr(session, "auto_approval_enabled", False)):
+            return False
+        cap = getattr(session, "auto_approval_cost_cap_usd", None)
+        if cap is None:
+            return False
+        try:
+            cap_usd = max(0.0, float(cap))
+        except (TypeError, ValueError):
+            return False
+
+        current_spend, billing_source = await self._current_session_usage_spend(
+            agent_session,
+            use_cache=False,
+        )
+        raw_observed_cost = payload.get("observed_cost_usd")
+        observed_cost = (
+            max(0.0, float(raw_observed_cost))
+            if isinstance(raw_observed_cost, (int, float))
+            and not isinstance(raw_observed_cost, bool)
+            else 0.0
+        )
+        previous_ledger_spend = session_spend_usd(session)
+        seed_session_spend(session, current_spend)
+        ledger_spend = session_spend_usd(session)
+        effective_spend = max(current_spend, ledger_spend)
+        if effective_spend < cap_usd:
+            if ledger_spend != previous_ledger_spend or observed_cost > 0:
+                self._touch(agent_session)
+                await session.send_event(
+                    Event(
+                        event_type="session_update",
+                        data={
+                            "session_id": session_id,
+                            "auto_approval": self._auto_approval_summary(session),
+                        },
+                    )
+                )
+            return False
+
+        spend_kind = str(payload.get("spend_kind") or "session usage")
+        final_response = payload.get("final_response")
+        created = await request_yolo_budget_exceeded_approval(
+            session,
+            spend_kind=spend_kind,
+            current_spend_usd=effective_spend,
+            cap_usd=cap_usd,
+            billing_source=billing_source,
+            continuation=payload.get("continuation"),
+            final_response=final_response if isinstance(final_response, str) else None,
+            history_size=payload.get("history_size"),
+            reason=(
+                "YOLO cap paused session usage after "
+                f"{spend_kind}: current session spend ${effective_spend:.2f} "
+                f"has reached the ${cap_usd:.2f} cap."
+            ),
+        )
+        if created:
+            self._touch(agent_session)
+        return created
 
     async def _start_agent_session(
         self,
@@ -910,6 +1011,7 @@ class SessionManager:
                     user_plan=user_plan,
                 )
                 self._install_usage_threshold_checker(existing)
+                self._install_yolo_budget_checker(existing)
                 self._restart_cpu_preload_if_token_recovered(
                     existing,
                     preload_sandbox=preload_sandbox,
@@ -933,6 +1035,7 @@ class SessionManager:
                     user_plan=user_plan,
                 )
                 self._install_usage_threshold_checker(existing)
+                self._install_yolo_budget_checker(existing)
                 self._restart_cpu_preload_if_token_recovered(
                     existing,
                     preload_sandbox=preload_sandbox,
@@ -1059,6 +1162,7 @@ class SessionManager:
             title=meta.get("title"),
         )
         self._install_usage_threshold_checker(agent_session)
+        self._install_yolo_budget_checker(agent_session)
         started = await self._start_agent_session(
             agent_session=agent_session,
             event_queue=event_queue,
@@ -1164,6 +1268,7 @@ class SessionManager:
                 user_plan=user_plan,
             )
             self._install_usage_threshold_checker(agent_session)
+            self._install_yolo_budget_checker(agent_session)
 
             await self._start_agent_session(
                 agent_session=agent_session,
@@ -1725,6 +1830,15 @@ class SessionManager:
             raise ValueError("Session not found or inactive")
 
         session = agent_session.session
+        seed_spend: float | None = None
+        if enabled:
+            try:
+                seed_spend, _ = await self._current_session_usage_spend(
+                    agent_session,
+                    use_cache=False,
+                )
+            except Exception as e:
+                logger.debug("Could not seed YOLO spend for %s: %s", session_id, e)
         if enabled:
             if not cap_provided and cost_cap_usd is None:
                 cost_cap_usd = getattr(session, "auto_approval_cost_cap_usd", None)
@@ -1744,8 +1858,30 @@ class SessionManager:
         else:
             session.auto_approval_enabled = bool(enabled)
             session.auto_approval_cost_cap_usd = cost_cap_usd
+        if enabled and seed_spend is not None:
+            seed_session_spend(session, seed_spend)
         self._touch(agent_session)
         await self.persist_session_snapshot(agent_session)
+        return self._auto_approval_summary(session)
+
+    async def reconcile_session_auto_approval_from_usage(
+        self,
+        session_id: str,
+        usage_response: dict[str, Any],
+    ) -> dict[str, Any] | None:
+        agent_session = self.sessions.get(session_id)
+        if not agent_session or not agent_session.is_active:
+            return None
+
+        session = agent_session.session
+        if not bool(getattr(session, "auto_approval_enabled", False)):
+            return self._auto_approval_summary(session)
+
+        current_spend, _ = self._usage_spend_from_response(usage_response)
+        previous_spend = session_spend_usd(session)
+        seed_session_spend(session, current_spend)
+        if session_spend_usd(session) != previous_spend:
+            self._touch(agent_session)
         return self._auto_approval_summary(session)
 
     def get_session_owner(self, session_id: str) -> str | None:

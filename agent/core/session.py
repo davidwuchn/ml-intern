@@ -158,8 +158,10 @@ class Session:
         self.auto_approval_enabled: bool = False
         self.auto_approval_cost_cap_usd: float | None = None
         self.auto_approval_estimated_spend_usd: float = 0.0
+        self._yolo_budget_reservations: dict[str, Any] = {}
         self.usage_warning_next_threshold_usd: float = USAGE_WARNING_FIRST_THRESHOLD_USD
         self.usage_threshold_checker: Any | None = None
+        self.yolo_budget_checker: Any | None = None
 
         # Session trajectory logging
         self.logged_events: list[dict] = []
@@ -464,6 +466,7 @@ class Session:
         self._last_heartbeat_ts = None
         self.pending_approval = None
         self.auto_approval_estimated_spend_usd = 0.0
+        self._yolo_budget_reservations = {}
         self.reset_cancel()
 
         # Previous-session metadata is intentionally included for event

@@ -30,6 +30,7 @@ from litellm import acompletion
 
 from agent.core.llm_params import UnsupportedEffortError, _resolve_llm_params
 from agent.core.prompt_caching import router_session_id_for, with_prompt_cache_params
+from agent.core.yolo_budget import maybe_pause_yolo_after_spend
 
 logger = logging.getLogger(__name__)
 
@@ -201,12 +202,13 @@ async def probe_effort(
             continue
 
         attempts += 1
+        probe_messages = [{"role": "user", "content": "ping"}]
+        params = {**params, "max_tokens": _PROBE_MAX_TOKENS}
         try:
             _t0 = time.monotonic()
             response = await asyncio.wait_for(
                 acompletion(
-                    messages=[{"role": "user", "content": "ping"}],
-                    max_tokens=_PROBE_MAX_TOKENS,
+                    messages=probe_messages,
                     stream=False,
                     **params,
                 ),
@@ -218,7 +220,7 @@ async def probe_effort(
                 try:
                     from agent.core import telemetry
 
-                    await telemetry.record_llm_call(
+                    usage = await telemetry.record_llm_call(
                         session,
                         model=model_name,
                         response=response,
@@ -228,6 +230,19 @@ async def probe_effort(
                         else None,
                         kind="effort_probe",
                     )
+                    if await maybe_pause_yolo_after_spend(
+                        session,
+                        spend_kind="effort_probe",
+                        observed_cost_usd=usage.get("cost_usd")
+                        if isinstance(usage, dict)
+                        else None,
+                    ):
+                        return ProbeOutcome(
+                            effective_effort=effort,
+                            attempts=attempts,
+                            elapsed_ms=int((loop.time() - start) * 1000),
+                            note="YOLO budget paused effort probe",
+                        )
                 except Exception as _telem_err:
                     logger.debug("effort_probe telemetry failed: %s", _telem_err)
         except Exception as e:

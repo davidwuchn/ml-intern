@@ -17,6 +17,7 @@ export type EventType =
   | 'hf_job_complete'
   | 'sandbox_create'
   | 'sandbox_destroy'
+  | 'session_update'
   | 'turn_complete'
   | 'compacted'
   | 'error'
@@ -66,6 +67,11 @@ export interface PlanUpdateEventData {
 export interface ApprovalRequiredEventData {
   tools: ApprovalToolItem[];
   count: number;
+  yolo_budget?: boolean;
+  auto_approval_blocked?: boolean;
+  block_reason?: string | null;
+  estimated_cost_usd?: number | null;
+  remaining_cap_usd?: number | null;
 }
 
 export interface ApprovalToolItem {
